@@ -92,5 +92,19 @@ public:
         // Add your additional declarations here
         //
 
+private:
+        /** Apply the configured deadline timeout (ms from now) to a call context. **/
+        void SetDeadline(grpc::ClientContext& context) const;
+
+        /**
+         * Map a gRPC status onto the codes this client is allowed to return:
+         * OK, DEADLINE_EXCEEDED, NOT_FOUND (only if `allow_not_found`), else CANCELLED.
+         * Logs the failure reason.
+         */
+        grpc::StatusCode HandleStatus(const std::string& operation,
+                                      const std::string& filename,
+                                      const grpc::Status& status,
+                                      bool allow_not_found) const;
+
 };
 #endif

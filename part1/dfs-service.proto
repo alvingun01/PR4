@@ -4,22 +4,57 @@ package dfs_service;
 
 service DFSService {
 
-    // Add your service calls here
-
     // 1. REQUIRED (Parts 1 & 2): A method to store files on the server
+    //    Client streams the file: the first chunk carries the file name,
+    //    every chunk may carry a slice of the file's bytes.
+    rpc StoreFile(stream FileChunk) returns (StoreResponse);
 
     // 2. REQUIRED (Parts 1 & 2): A method to fetch files from the server
+    //    Server streams the file contents back in chunks.
+    rpc FetchFile(FileRequest) returns (stream FileChunk);
 
     // 3. REQUIRED (Parts 1 & 2): A method to delete files from the server
+    rpc DeleteFile(FileRequest) returns (DeleteResponse);
 
     // 4. REQUIRED (Parts 1 & 2): A method to list all files on the server
+    rpc ListFiles(ListRequest) returns (ListResponse);
 
     // 5. REQUIRED (Parts 1 & 2): A method to get the status of a file on the server
-
-    // 7. Any other methods you deem necessary to complete the tasks of this assignment
-
+    rpc GetFileStatus(FileRequest) returns (FileStatus);
 
 }
 
-// Add your message types here
+// Identifies a single file on the server by name (no directories).
+message FileRequest {
+    string name = 1;
+}
 
+// One piece of a streamed file transfer.
+// For StoreFile, `name` must be set on the first chunk (it is ignored afterwards).
+message FileChunk {
+    string name = 1;
+    bytes data = 2;
+}
+
+// Status/attributes of a file on the server.
+message FileStatus {
+    string name = 1;
+    uint64 size = 2;
+    int64 mtime = 3;   // seconds since the epoch
+    int64 ctime = 4;   // seconds since the epoch
+}
+
+message StoreResponse {
+    FileStatus status = 1;
+}
+
+message DeleteResponse {
+    string name = 1;
+}
+
+message ListRequest {
+}
+
+message ListResponse {
+    repeated FileStatus files = 1;
+}

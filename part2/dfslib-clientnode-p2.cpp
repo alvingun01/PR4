@@ -5,6 +5,7 @@
 #include <thread>
 #include <cstdio>
 #include <chrono>
+#include <cstring>
 #include <errno.h>
 #include <csignal>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <limits.h>
+#include <dirent.h>
 #include <sys/inotify.h>
 #include <grpcpp/grpcpp.h>
 #include <utime.h>
@@ -30,6 +32,13 @@ using grpc::StatusCode;
 using grpc::ClientWriter;
 using grpc::ClientReader;
 using grpc::ClientContext;
+
+using dfs_service::FileRequest;
+using dfs_service::FileChunk;
+using dfs_service::FileStatus;
+using dfs_service::FileList;
+using dfs_service::DeletedFile;
+using dfs_service::WriteLockResponse;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -66,6 +75,19 @@ grpc::StatusCode DFSClientNodeP2::RequestWriteAccess(const std::string &filename
     //
     //
 
+    ClientContext context;
+    SetDeadline(context);
+
+    FileRequest request;
+    request.set_name(filename);
+    request.set_client_id(this->client_id);
+    WriteLockResponse response;
+
+    Status status = service_stub->RequestWriteLock(&context, request, &response);
+    if (status.ok()) {
+        dfs_log(LL_DEBUG2) << "RequestWriteAccess: lock granted for " << filename;
+    }
+    return HandleStatus("RequestWriteAccess", filename, status, {StatusCode::RESOURCE_EXHAUSTED});
 }
 
 grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
@@ -95,6 +117,91 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
     //
     //
 
+    const std::string path = WrapPath(filename);
+
+    struct stat st;
+    std::uint32_t crc = 0;
+    if (!this->crc_cache.Get(path, &this->crc_table, &crc, &st)) {
+        dfs_log(LL_ERROR) << "Store: file not found on client: " << path;
+        return StatusCode::NOT_FOUND;
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        dfs_log(LL_ERROR) << "Store: unable to open " << path << ": " << strerror(errno);
+        return StatusCode::NOT_FOUND;
+    }
+
+    StatusCode lock_status = RequestWriteAccess(filename);
+    if (lock_status != StatusCode::OK) {
+        dfs_log(LL_DEBUG) << "Store: no write lock for " << filename << " (" << lock_status << ")";
+        return lock_status;
+    }
+
+    ClientContext context;
+    SetDeadline(context);
+
+    FileStatus response;
+    std::unique_ptr<ClientWriter<FileChunk>> writer(
+            service_stub->StoreFile(&context, &response));
+
+    // Message 1: metadata only. The server either answers ALREADY_EXISTS
+    // straight away, or sends initial metadata marked "proceed".
+    FileChunk chunk;
+    chunk.set_name(filename);
+    chunk.set_client_id(this->client_id);
+    chunk.set_crc(crc);
+    chunk.set_mtime(static_cast<std::int64_t>(st.st_mtime));
+
+    bool stream_ok = writer->Write(chunk);
+    bool proceed = false;
+    if (stream_ok) {
+        writer->WaitForInitialMetadata();
+        const auto& metadata = context.GetServerInitialMetadata();
+        proceed = metadata.find(DFS_STORE_PROCEED_KEY) != metadata.end();
+    }
+
+    size_t bytes_sent = 0;
+    if (stream_ok && proceed) {
+        dfs_log(LL_DEBUG) << "Store: sending " << filename << " (" << st.st_size << " bytes)";
+        std::vector<char> buffer(DFS_CHUNK_SIZE);
+        FileChunk data_chunk;
+        while (in) {
+            in.read(buffer.data(), buffer.size());
+            std::streamsize count = in.gcount();
+            if (count <= 0) {
+                break;
+            }
+            data_chunk.set_data(buffer.data(), static_cast<size_t>(count));
+            if (!writer->Write(data_chunk)) {
+                // Stream broken (deadline, server error, ...). Finish() reports why.
+                stream_ok = false;
+                break;
+            }
+            bytes_sent += static_cast<size_t>(count);
+        }
+        if (in.bad()) {
+            dfs_log(LL_ERROR) << "Store: error reading " << path;
+            context.TryCancel();
+        }
+    }
+
+    if (stream_ok) {
+        writer->WritesDone();
+    }
+    Status status = writer->Finish();
+
+    if (in.bad() && status.ok()) {
+        return StatusCode::CANCELLED;
+    }
+    if (status.ok()) {
+        dfs_log(LL_DEBUG) << "Store: stored " << filename << " (" << bytes_sent << " bytes, mtime "
+                          << response.mtime() << ")";
+    } else if (status.error_code() == StatusCode::ALREADY_EXISTS) {
+        dfs_log(LL_DEBUG) << "Store: " << filename << " unchanged on server";
+    }
+    return HandleStatus("Store", filename, status,
+                        {StatusCode::ALREADY_EXISTS, StatusCode::RESOURCE_EXHAUSTED});
 }
 
 
@@ -121,6 +228,98 @@ grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
     //
     // Hint: You may want to match the mtime on local files to the server's mtime
     //
+
+    const std::string path = WrapPath(filename);
+    // Download into a hidden temp file (ignored by the watcher) and rename it
+    // into place: a failed fetch never clobbers the local copy, and the rename
+    // raises IN_MOVED_TO, which the watcher does not treat as a local edit.
+    const std::string tmp_path = dfs_temp_path(this->mount_path, filename, DFS_DOWNLOAD_SUFFIX);
+
+    FileRequest request;
+    request.set_name(filename);
+    request.set_client_id(this->client_id);
+    std::uint32_t local_crc = 0;
+    if (this->crc_cache.Get(path, &this->crc_table, &local_crc)) {
+        request.set_crc(local_crc);
+        request.set_has_crc(true);
+    }
+
+    ClientContext context;
+    SetDeadline(context);
+
+    std::unique_ptr<ClientReader<FileChunk>> reader(
+            service_stub->FetchFile(&context, request));
+
+    std::ofstream out;
+    bool write_error = false;
+    bool received_any = false;
+    std::int64_t server_mtime = 0;
+    size_t bytes_received = 0;
+    FileChunk chunk;
+
+    while (reader->Read(&chunk)) {
+        if (!received_any) {
+            received_any = true;
+            server_mtime = chunk.mtime();
+            out.open(tmp_path, std::ios::binary | std::ios::trunc);
+            if (!out.is_open()) {
+                dfs_log(LL_ERROR) << "Fetch: unable to open " << tmp_path << ": " << strerror(errno);
+                write_error = true;
+                context.TryCancel();
+                break;
+            }
+        }
+        const std::string& data = chunk.data();
+        out.write(data.data(), data.size());
+        if (!out) {
+            dfs_log(LL_ERROR) << "Fetch: error writing " << tmp_path;
+            write_error = true;
+            context.TryCancel();
+            break;
+        }
+        bytes_received += data.size();
+    }
+
+    if (write_error) {
+        // Drain whatever is left so Finish() does not block.
+        while (reader->Read(&chunk)) {}
+    }
+
+    Status status = reader->Finish();
+
+    if (out.is_open()) {
+        out.close();
+    }
+
+    if (!status.ok() || write_error || !received_any) {
+        ::remove(tmp_path.c_str());
+        if (status.error_code() == StatusCode::ALREADY_EXISTS) {
+            dfs_log(LL_DEBUG) << "Fetch: " << filename << " unchanged on server";
+            return StatusCode::ALREADY_EXISTS;
+        }
+        if (write_error && status.error_code() != StatusCode::DEADLINE_EXCEEDED) {
+            return StatusCode::CANCELLED;
+        }
+        if (status.ok()) {
+            dfs_log(LL_ERROR) << "Fetch: empty response for " << filename;
+            return StatusCode::CANCELLED;
+        }
+        return HandleStatus("Fetch", filename, status, {StatusCode::NOT_FOUND});
+    }
+
+    // Match the server's mtime, so both sides agree the copies are in sync.
+    if (server_mtime > 0 && !dfs_set_mtime(tmp_path, server_mtime)) {
+        dfs_log(LL_ERROR) << "Fetch: unable to set mtime on " << tmp_path << ": " << strerror(errno);
+    }
+
+    if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        dfs_log(LL_ERROR) << "Fetch: rename to " << path << " failed: " << strerror(errno);
+        ::remove(tmp_path.c_str());
+        return StatusCode::CANCELLED;
+    }
+
+    dfs_log(LL_DEBUG) << "Fetch: received " << filename << " (" << bytes_received << " bytes)";
+    return StatusCode::OK;
 }
 
 grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
@@ -145,6 +344,38 @@ grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
     //
     //
 
+    {
+        // A deletion this client made itself because the server deleted the
+        // file: the server is already up to date.
+        std::lock_guard<std::mutex> lock(this->suppressed_mutex);
+        auto it = this->suppressed_deletes.find(filename);
+        if (it != this->suppressed_deletes.end()) {
+            this->suppressed_deletes.erase(it);
+            dfs_log(LL_DEBUG2) << "Delete: " << filename << " was removed by sync; not sent to server";
+            return StatusCode::OK;
+        }
+    }
+
+    StatusCode lock_status = RequestWriteAccess(filename);
+    if (lock_status != StatusCode::OK) {
+        dfs_log(LL_DEBUG) << "Delete: no write lock for " << filename << " (" << lock_status << ")";
+        return lock_status;
+    }
+
+    ClientContext context;
+    SetDeadline(context);
+
+    FileRequest request;
+    request.set_name(filename);
+    request.set_client_id(this->client_id);
+    FileStatus response;
+
+    Status status = service_stub->DeleteFile(&context, request, &response);
+    if (status.ok()) {
+        dfs_log(LL_DEBUG) << "Delete: deleted " << filename;
+    }
+    return HandleStatus("Delete", filename, status,
+                        {StatusCode::NOT_FOUND, StatusCode::RESOURCE_EXHAUSTED});
 }
 
 grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool display) {
@@ -165,6 +396,33 @@ grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    ClientContext context;
+    SetDeadline(context);
+
+    FileRequest request;
+    request.set_client_id(this->client_id);
+    FileList response;
+
+    Status status = service_stub->ListFiles(&context, request, &response);
+    if (!status.ok()) {
+        return HandleStatus("List", "", status, {});
+    }
+
+    for (const FileStatus& file : response.files()) {
+        if (file_map != nullptr) {
+            (*file_map)[file.name()] = static_cast<int>(file.mtime());
+        }
+        if (display) {
+            std::cout << std::left << std::setw(40) << file.name()
+                      << " mtime: " << file.mtime()
+                      << "  size: " << file.size()
+                      << "  crc: " << file.crc() << std::endl;
+        }
+    }
+
+    dfs_log(LL_DEBUG) << "List: " << response.files_size() << " files";
+    return StatusCode::OK;
 }
 
 grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_status) {
@@ -186,6 +444,30 @@ grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_s
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    ClientContext context;
+    SetDeadline(context);
+
+    FileRequest request;
+    request.set_name(filename);
+    request.set_client_id(this->client_id);
+    FileStatus response;
+
+    Status status = service_stub->GetFileStatus(&context, request, &response);
+    if (!status.ok()) {
+        return HandleStatus("Stat", filename, status, {StatusCode::NOT_FOUND});
+    }
+
+    if (file_status != nullptr) {
+        static_cast<FileStatus*>(file_status)->CopyFrom(response);
+    } else {
+        std::cout << "name:  " << response.name() << std::endl
+                  << "size:  " << response.size() << std::endl
+                  << "mtime: " << response.mtime() << std::endl
+                  << "ctime: " << response.ctime() << std::endl
+                  << "crc:   " << response.crc() << std::endl;
+    }
+    return StatusCode::OK;
 }
 
 void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
@@ -209,7 +491,9 @@ void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
     // the async thread when a file event has been signaled?
     //
 
-
+    // The callback stores/deletes files; never let it run while the async
+    // thread is reconciling the mount, and vice versa.
+    std::lock_guard<std::mutex> lock(this->sync_mutex);
     callback();
 
 }
@@ -282,9 +566,13 @@ void DFSClientNodeP2::HandleCallbackList() {
                 // Do nothing?
                 //
 
-
+                // Critical section: the watcher thread cannot store/delete
+                // while this thread reconciles the mount.
+                std::lock_guard<std::mutex> lock(this->sync_mutex);
+                SyncWithServer(call_data->reply);
 
             } else {
+                // Not holding sync_mutex here, so the watcher keeps working while we back off.
                 dfs_log(LL_ERROR) << "Status was not ok. Will try again in " << DFS_RESET_TIMEOUT << " milliseconds.";
                 dfs_log(LL_ERROR) << call_data->status.error_message();
                 std::this_thread::sleep_for(std::chrono::milliseconds(DFS_RESET_TIMEOUT));
@@ -300,6 +588,13 @@ void DFSClientNodeP2::HandleCallbackList() {
 
         }
 
+        if (this->Unmounting()) {
+            break;
+        }
+
+        // The server answers every CallbackList immediately, so pace the
+        // polling instead of hammering it in a tight loop.
+        std::this_thread::sleep_for(std::chrono::milliseconds(DFS_CALLBACK_INTERVAL_MS));
 
         // Start the process over and wait for the next callback response
         dfs_log(LL_DEBUG3) << "Calling InitCallbackList";
@@ -326,3 +621,134 @@ void DFSClientNodeP2::InitCallbackList() {
 // Add any additional code you need to here
 //
 
+void DFSClientNodeP2::SetDeadline(ClientContext& context) const {
+    context.set_deadline(std::chrono::system_clock::now() +
+                         std::chrono::milliseconds(this->deadline_timeout));
+}
+
+StatusCode DFSClientNodeP2::HandleStatus(const std::string& operation,
+                                         const std::string& filename,
+                                         const Status& status,
+                                         std::initializer_list<StatusCode> allowed) const {
+    const StatusCode code = status.error_code();
+    if (code == StatusCode::OK) {
+        return StatusCode::OK;
+    }
+    if (code == StatusCode::DEADLINE_EXCEEDED) {
+        dfs_log(LL_ERROR) << operation << ": deadline exceeded ("
+                          << this->deadline_timeout << "ms) " << filename;
+        return StatusCode::DEADLINE_EXCEEDED;
+    }
+    for (StatusCode allowed_code : allowed) {
+        if (code == allowed_code) {
+            // Expected outcomes (lock contention, not found, unchanged) are not errors.
+            dfs_log(LL_DEBUG) << operation << " " << filename << ": [" << code << "] "
+                              << status.error_message();
+            return code;
+        }
+    }
+    dfs_log(LL_ERROR) << operation << " failed for " << filename << ": ["
+                      << code << "] " << status.error_message();
+    return StatusCode::CANCELLED;
+}
+
+void DFSClientNodeP2::DeleteLocal(const std::string& filename) {
+    const std::string path = WrapPath(filename);
+    {
+        std::lock_guard<std::mutex> lock(this->suppressed_mutex);
+        this->suppressed_deletes.insert(filename);
+    }
+    if (::remove(path.c_str()) != 0) {
+        // No IN_DELETE will arrive, so don't leave the suppression behind.
+        std::lock_guard<std::mutex> lock(this->suppressed_mutex);
+        this->suppressed_deletes.erase(filename);
+        if (errno != ENOENT) {
+            dfs_log(LL_ERROR) << "Sync: unable to delete " << path << ": " << strerror(errno);
+        }
+        return;
+    }
+    this->crc_cache.Forget(path);
+    dfs_log(LL_DEBUG) << "Sync: deleted local " << filename << " (deleted on server)";
+}
+
+void DFSClientNodeP2::SyncWithServer(const FileList& listing) {
+
+    std::map<std::string, const FileStatus*> server_files;
+    for (const FileStatus& file : listing.files()) {
+        if (dfs_is_syncable_filename(file.name())) {
+            server_files[file.name()] = &file;
+        }
+    }
+
+    std::map<std::string, std::int64_t> tombstones;
+    for (const DeletedFile& deleted : listing.deleted()) {
+        tombstones[deleted.name()] = deleted.deleted_at();
+    }
+
+    // Every name present on either side.
+    std::set<std::string> names;
+    for (const auto& entry : server_files) {
+        names.insert(entry.first);
+    }
+    DIR* dir = ::opendir(this->mount_path.c_str());
+    if (dir == nullptr) {
+        dfs_log(LL_ERROR) << "Sync: cannot open mount " << this->mount_path << ": " << strerror(errno);
+        return;
+    }
+    struct dirent* entry;
+    while ((entry = ::readdir(dir)) != nullptr) {
+        const std::string name(entry->d_name);
+        if (dfs_is_syncable_filename(name)) {
+            names.insert(name);
+        }
+    }
+    ::closedir(dir);
+
+    for (const std::string& name : names) {
+        if (this->Unmounting()) {
+            return;
+        }
+
+        const std::string path = WrapPath(name);
+        struct stat st;
+        const bool local_exists = ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+        auto server_it = server_files.find(name);
+        const FileStatus* server = server_it != server_files.end() ? server_it->second : nullptr;
+
+        if (server != nullptr && local_exists) {
+            const std::int64_t local_mtime = static_cast<std::int64_t>(st.st_mtime);
+            std::uint32_t local_crc = 0;
+            if (!this->crc_cache.Get(path, &this->crc_table, &local_crc)) {
+                continue;  // vanished since the stat; the watcher will report it
+            }
+            if (local_crc == server->crc()) {
+                continue;  // same contents (timestamps may differ): nothing to do
+            }
+            // Contents differ: the newer modification wins. mtimes have
+            // one-second resolution, so two clients writing within the same
+            // second tie; the server's copy wins ties, otherwise the losing
+            // client would stay out of sync forever.
+            if (server->mtime() >= local_mtime) {
+                dfs_log(LL_DEBUG) << "Sync: server copy of " << name << " is newer; fetching";
+                Fetch(name);
+            } else {
+                dfs_log(LL_DEBUG) << "Sync: local copy of " << name << " is newer; storing";
+                Store(name);
+            }
+        } else if (server != nullptr) {
+            dfs_log(LL_DEBUG) << "Sync: " << name << " only on server; fetching";
+            Fetch(name);
+        } else if (local_exists) {
+            auto tomb_it = tombstones.find(name);
+            if (tomb_it != tombstones.end() &&
+                    tomb_it->second >= static_cast<std::int64_t>(st.st_mtime)) {
+                // Deleted on the server after our copy was last modified.
+                DeleteLocal(name);
+            } else {
+                // New local file (including files present before mounting).
+                dfs_log(LL_DEBUG) << "Sync: " << name << " only on client; storing";
+                Store(name);
+            }
+        }
+    }
+}

@@ -23,3 +23,15 @@ dfs_log_level_e DFS_LOG_LEVEL = LL_ERROR;
 // Just be aware they are always submitted, so they should
 // be compilable.
 //
+
+bool dfs_is_valid_filename(const std::string& name) {
+    if (name.empty() || name == "." || name == "..") {
+        return false;
+    }
+    for (char c : name) {
+        if (c == '/' || c == '\\' || c == '\0') {
+            return false;
+        }
+    }
+    return true;
+}

@@ -1,4 +1,6 @@
 #include <map>
+#include <vector>
+#include <cstring>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -25,6 +27,13 @@ using grpc::ServerContext;
 using grpc::ServerBuilder;
 
 using dfs_service::DFSService;
+using dfs_service::FileChunk;
+using dfs_service::FileRequest;
+using dfs_service::FileStatus;
+using dfs_service::StoreResponse;
+using dfs_service::DeleteResponse;
+using dfs_service::ListRequest;
+using dfs_service::ListResponse;
 
 
 //
@@ -89,6 +98,255 @@ public:
     // implementations of your protocol service methods
     //
 
+    /**
+     * Store a file streamed from the client.
+     *
+     * The first chunk must carry the file name. Data is written to a
+     * temporary file and only renamed into place once the whole stream
+     * has arrived, so an interrupted upload never leaves a partial file.
+     */
+    Status StoreFile(ServerContext* context,
+                     ServerReader<FileChunk>* reader,
+                     StoreResponse* response) override {
+
+        FileChunk chunk;
+        if (!reader->Read(&chunk)) {
+            if (context->IsCancelled()) {
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+            }
+            return Status(StatusCode::INVALID_ARGUMENT, "Empty store stream");
+        }
+
+        const std::string name = chunk.name();
+        if (!dfs_is_valid_filename(name)) {
+            return Status(StatusCode::INVALID_ARGUMENT, "Invalid file name: " + name);
+        }
+
+        const std::string path = WrapPath(name);
+        const std::string tmp_path = WrapPath("." + name + ".dfs-upload");
+        dfs_log(LL_DEBUG) << "StoreFile: receiving " << name;
+
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            dfs_log(LL_ERROR) << "StoreFile: cannot open " << tmp_path << ": " << strerror(errno);
+            return Status(StatusCode::INTERNAL, "Unable to open file for writing");
+        }
+
+        size_t bytes_written = 0;
+        do {
+            if (context->IsCancelled()) {
+                out.close();
+                ::remove(tmp_path.c_str());
+                dfs_log(LL_ERROR) << "StoreFile: deadline exceeded/cancelled for " << name;
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+            }
+            const std::string& data = chunk.data();
+            if (!data.empty()) {
+                out.write(data.data(), data.size());
+                if (!out) {
+                    out.close();
+                    ::remove(tmp_path.c_str());
+                    return Status(StatusCode::INTERNAL, "Error writing file");
+                }
+                bytes_written += data.size();
+            }
+        } while (reader->Read(&chunk));
+
+        out.close();
+
+        // Read() also returns false when the call is cancelled mid-stream.
+        if (context->IsCancelled()) {
+            ::remove(tmp_path.c_str());
+            dfs_log(LL_ERROR) << "StoreFile: deadline exceeded/cancelled for " << name;
+            return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+        }
+
+        if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+            ::remove(tmp_path.c_str());
+            dfs_log(LL_ERROR) << "StoreFile: rename failed for " << name << ": " << strerror(errno);
+            return Status(StatusCode::INTERNAL, "Unable to finalize stored file");
+        }
+
+        FileStatus* status = response->mutable_status();
+        if (!FillStatus(name, status)) {
+            return Status(StatusCode::INTERNAL, "Unable to stat stored file");
+        }
+
+        dfs_log(LL_DEBUG) << "StoreFile: stored " << name << " (" << bytes_written << " bytes)";
+        return Status::OK;
+    }
+
+    /**
+     * Stream a file's contents back to the client.
+     */
+    Status FetchFile(ServerContext* context,
+                     const FileRequest* request,
+                     ServerWriter<FileChunk>* writer) override {
+
+        const std::string& name = request->name();
+        if (!dfs_is_valid_filename(name)) {
+            return Status(StatusCode::INVALID_ARGUMENT, "Invalid file name: " + name);
+        }
+
+        const std::string path = WrapPath(name);
+        struct stat st;
+        if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            dfs_log(LL_DEBUG) << "FetchFile: not found " << name;
+            return Status(StatusCode::NOT_FOUND, "File not found: " + name);
+        }
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open()) {
+            return Status(StatusCode::NOT_FOUND, "Unable to open file: " + name);
+        }
+
+        dfs_log(LL_DEBUG) << "FetchFile: sending " << name << " (" << st.st_size << " bytes)";
+
+        std::vector<char> buffer(DFS_CHUNK_SIZE);
+        FileChunk chunk;
+        chunk.set_name(name);
+        while (in) {
+            if (context->IsCancelled()) {
+                dfs_log(LL_ERROR) << "FetchFile: deadline exceeded/cancelled for " << name;
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+            }
+            in.read(buffer.data(), buffer.size());
+            std::streamsize count = in.gcount();
+            if (count <= 0) {
+                break;
+            }
+            chunk.set_data(buffer.data(), static_cast<size_t>(count));
+            if (!writer->Write(chunk)) {
+                // Stream broken: the client went away or the deadline passed.
+                if (context->IsCancelled()) {
+                    return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+                }
+                return Status(StatusCode::CANCELLED, "Stream closed by client");
+            }
+            chunk.clear_name();
+        }
+
+        if (in.bad()) {
+            return Status(StatusCode::INTERNAL, "Error reading file: " + name);
+        }
+
+        return Status::OK;
+    }
+
+    /**
+     * Delete a file from the server's mount path.
+     */
+    Status DeleteFile(ServerContext* context,
+                      const FileRequest* request,
+                      DeleteResponse* response) override {
+
+        const std::string& name = request->name();
+        if (!dfs_is_valid_filename(name)) {
+            return Status(StatusCode::INVALID_ARGUMENT, "Invalid file name: " + name);
+        }
+        if (context->IsCancelled()) {
+            return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+        }
+
+        const std::string path = WrapPath(name);
+        struct stat st;
+        if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            return Status(StatusCode::NOT_FOUND, "File not found: " + name);
+        }
+
+        if (::remove(path.c_str()) != 0) {
+            if (errno == ENOENT) {
+                return Status(StatusCode::NOT_FOUND, "File not found: " + name);
+            }
+            dfs_log(LL_ERROR) << "DeleteFile: failed for " << name << ": " << strerror(errno);
+            return Status(StatusCode::INTERNAL, "Unable to delete file: " + name);
+        }
+
+        response->set_name(name);
+        dfs_log(LL_DEBUG) << "DeleteFile: deleted " << name;
+        return Status::OK;
+    }
+
+    /**
+     * List every regular file in the mount path with its mtime.
+     */
+    Status ListFiles(ServerContext* context,
+                     const ListRequest* request,
+                     ListResponse* response) override {
+
+        DIR* dir = ::opendir(this->mount_path.c_str());
+        if (dir == nullptr) {
+            dfs_log(LL_ERROR) << "ListFiles: cannot open " << this->mount_path << ": " << strerror(errno);
+            return Status(StatusCode::INTERNAL, "Unable to open mount directory");
+        }
+
+        struct dirent* entry;
+        while ((entry = ::readdir(dir)) != nullptr) {
+            if (context->IsCancelled()) {
+                ::closedir(dir);
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+            }
+            const std::string name(entry->d_name);
+            if (!dfs_is_valid_filename(name) || IsUploadTempFile(name)) {
+                continue;
+            }
+            FileStatus status;
+            if (FillStatus(name, &status)) {
+                *response->add_files() = status;
+            }
+        }
+        ::closedir(dir);
+
+        dfs_log(LL_DEBUG) << "ListFiles: " << response->files_size() << " files";
+        return Status::OK;
+    }
+
+    /**
+     * Return size and time attributes for a single file.
+     */
+    Status GetFileStatus(ServerContext* context,
+                         const FileRequest* request,
+                         FileStatus* response) override {
+
+        const std::string& name = request->name();
+        if (!dfs_is_valid_filename(name)) {
+            return Status(StatusCode::INVALID_ARGUMENT, "Invalid file name: " + name);
+        }
+        if (context->IsCancelled()) {
+            return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or client cancelled");
+        }
+        if (!FillStatus(name, response)) {
+            return Status(StatusCode::NOT_FOUND, "File not found: " + name);
+        }
+        return Status::OK;
+    }
+
+private:
+
+    /**
+     * Fill a FileStatus message for a regular file in the mount path.
+     *
+     * @return false if the file does not exist or is not a regular file
+     */
+    bool FillStatus(const std::string& name, FileStatus* status) {
+        struct stat st;
+        const std::string path = WrapPath(name);
+        if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            return false;
+        }
+        status->set_name(name);
+        status->set_size(static_cast<uint64_t>(st.st_size));
+        status->set_mtime(static_cast<int64_t>(st.st_mtime));
+        status->set_ctime(static_cast<int64_t>(st.st_ctime));
+        return true;
+    }
+
+    /** True for the hidden temp files StoreFile writes while an upload is in flight. **/
+    static bool IsUploadTempFile(const std::string& name) {
+        static const std::string suffix = ".dfs-upload";
+        return name.size() > suffix.size() + 1 && name[0] == '.' &&
+               name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
 
 };
 

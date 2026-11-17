@@ -7,9 +7,12 @@
 #include <limits.h>
 #include <chrono>
 #include <mutex>
+#include <set>
+#include <initializer_list>
 
 #include <grpcpp/grpcpp.h>
 
+#include "dfslib-shared-p2.h"
 #include "src/dfslibx-clientnode-p2.h"
 #include "proto-src/dfs-service.grpc.pb.h"
 
@@ -142,6 +145,52 @@ public:
     // You may add any additional declarations of methods or variables that you need here.
     //
 
+private:
+
+    /**
+     * Serializes the watcher thread and the async callback thread: each holds
+     * it while acting on the mount (store/fetch/delete), so the two never
+     * work on the same files at the same time.
+     */
+    std::mutex sync_mutex;
+
+    /** Checksums of local files, reused while a file is unchanged **/
+    DFSChecksumCache crc_cache;
+
+    /**
+     * Files the sync thread deleted locally because they were deleted on the
+     * server. The watcher will report those deletions as IN_DELETE events;
+     * Delete() swallows them instead of sending a redundant (and possibly
+     * harmful, if the file was re-created meanwhile) delete to the server.
+     */
+    std::mutex suppressed_mutex;
+    std::set<std::string> suppressed_deletes;
+
+    /** Apply the configured deadline timeout (ms from now) to a call context. **/
+    void SetDeadline(grpc::ClientContext& context) const;
+
+    /**
+     * Map a gRPC status onto the codes the caller may return. DEADLINE_EXCEEDED
+     * and the codes in `allowed` pass through; everything else becomes CANCELLED.
+     * Logs failures.
+     */
+    grpc::StatusCode HandleStatus(const std::string& operation,
+                                  const std::string& filename,
+                                  const grpc::Status& status,
+                                  std::initializer_list<grpc::StatusCode> allowed) const;
+
+    /**
+     * Reconcile the mount directory with a server listing:
+     *  - on both sides with different contents: newer mtime wins (fetch or store)
+     *  - only on the server: fetch
+     *  - only local: delete locally if the server's tombstone is at least as
+     *    new as the local copy, otherwise store it
+     * Caller holds sync_mutex.
+     */
+    void SyncWithServer(const dfs_service::FileList& listing);
+
+    /** Remove a local file that was deleted on the server (see suppressed_deletes). **/
+    void DeleteLocal(const std::string& filename);
 
 };
 #endif
